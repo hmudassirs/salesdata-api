@@ -17,6 +17,8 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi",
     "opentelemetry-api",
     "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-grpc",
+    "opentelemetry-exporter-prometheus",
     "prometheus-client",
     "psycopg2",
     "starlette",

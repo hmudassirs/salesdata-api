@@ -8,7 +8,7 @@ This module provides OpenTelemetry integration for the application, enabling:
 
 MOVED to core/observability/otel.py. This is the *only* place in the
 codebase that calls `trace.set_tracer_provider(...)` — the one call
-that actually connects a tracer to a real exporter (Jaeger/Prometheus).
+that actually connects a tracer to a real exporter (OTLP/Prometheus).
 Nothing anywhere called `get_otel_manager()` or
 `OpenTelemetryManager().initialize()`, and core/db/session.py obtained
 its tracer via a direct, unrelated `trace.get_tracer(__name__)` call
@@ -29,7 +29,7 @@ from functools import wraps
 from typing import Any, Callable, Optional
 
 from opentelemetry import metrics, trace
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.resources import Resource
@@ -45,25 +45,33 @@ class OpenTelemetryManager:
     def __init__(
         self,
         service_name: str = "preparedata",
-        jaeger_host: str = "localhost",
-        jaeger_port: int = 6831,
+        otlp_endpoint: str = "localhost:4317",
+        otlp_insecure: bool = True,
         enable_prometheus: bool = True,
-        enable_jaeger: bool = True,
+        enable_otlp: bool = True,
     ):
         """Initialize OpenTelemetry manager.
 
         Args:
             service_name: Service name for tracing
-            jaeger_host: Jaeger agent host
-            jaeger_port: Jaeger agent port
+            otlp_endpoint: OTLP gRPC collector endpoint (host:port). Matches
+                the default port (4317) of the OpenTelemetry Collector and
+                modern Jaeger (which accepts OTLP natively as of Jaeger 1.35+,
+                so this can still point at a Jaeger instance). Can also be
+                left at the default and overridden via the standard
+                `OTEL_EXPORTER_OTLP_ENDPOINT` env var, which `OTLPSpanExporter`
+                reads itself if `endpoint` isn't passed explicitly.
+            otlp_insecure: Skip TLS for the gRPC channel (default True for
+                local/sidecar collectors; set False for a collector requiring
+                TLS, e.g. behind a public endpoint).
             enable_prometheus: Enable Prometheus metrics export
-            enable_jaeger: Enable Jaeger trace export
+            enable_otlp: Enable OTLP trace export
         """
         self.service_name = service_name
-        self.jaeger_host = jaeger_host
-        self.jaeger_port = jaeger_port
+        self.otlp_endpoint = otlp_endpoint
+        self.otlp_insecure = otlp_insecure
         self.enable_prometheus = enable_prometheus
-        self.enable_jaeger = enable_jaeger
+        self.enable_otlp = enable_otlp
 
         self.tracer_provider: Optional[TracerProvider] = None
         self.meter_provider: Optional[MeterProvider] = None
@@ -83,21 +91,19 @@ class OpenTelemetryManager:
         # Initialize Tracer Provider
         self.tracer_provider = TracerProvider(resource=resource)
 
-        # Add Jaeger exporter if enabled
-        if self.enable_jaeger:
+        # Add OTLP exporter if enabled
+        if self.enable_otlp:
             try:
-                jaeger_exporter = JaegerExporter(
-                    agent_host_name=self.jaeger_host,
-                    agent_port=self.jaeger_port,
+                otlp_exporter = OTLPSpanExporter(
+                    endpoint=self.otlp_endpoint,
+                    insecure=self.otlp_insecure,
                 )
                 self.tracer_provider.add_span_processor(
-                    BatchSpanProcessor(jaeger_exporter)
+                    BatchSpanProcessor(otlp_exporter)
                 )
-                logger.info(
-                    f"Jaeger exporter enabled: {self.jaeger_host}:{self.jaeger_port}"
-                )
+                logger.info(f"OTLP exporter enabled: {self.otlp_endpoint}")
             except Exception as e:
-                logger.warning(f"Failed to initialize Jaeger exporter: {e}")
+                logger.warning(f"Failed to initialize OTLP exporter: {e}")
 
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)

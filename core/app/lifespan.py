@@ -26,8 +26,10 @@ lived somewhere else and got missed).
 import asyncio
 import functools
 import logging
+import os
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 
 from core.app.container import DependencyContainer
@@ -219,6 +221,14 @@ class ServiceDatabaseStep(LifecycleStep):
             await asyncio.to_thread(self.service_db.disconnect)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var, matching PerformanceConfig._read_bool's rules."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class PerformanceStep(LifecycleStep):
     """Owns the `core.performance` registry and its optional background
     resource-collector scheduler (CPU/memory/GC/threads/asyncio/process —
@@ -254,7 +264,20 @@ class PerformanceStep(LifecycleStep):
         if PerformanceConfig is None or get_default_registry is None:
             return {}
         registry = get_default_registry()
-        config = PerformanceConfig.from_env()
+        # PerformanceConfig.from_env() intentionally does not read the
+        # collect_* flags (no env var wired up for them yet — see
+        # docs/performance/configuration.md), so pull them in here
+        # ourselves via dataclasses.replace rather than silently getting
+        # an all-False config and starting no collectors.
+        config = replace(
+            PerformanceConfig.from_env(),
+            collect_memory=_env_flag("PERF_COLLECT_MEMORY"),
+            collect_gc=_env_flag("PERF_COLLECT_GC"),
+            collect_threads=_env_flag("PERF_COLLECT_THREADS"),
+            collect_cpu=_env_flag("PERF_COLLECT_CPU"),
+            collect_asyncio=_env_flag("PERF_COLLECT_ASYNCIO"),
+            collect_process=_env_flag("PERF_COLLECT_PROCESS"),
+        )
         if config.enabled and build_enabled_collectors is not None:
             collectors = build_enabled_collectors(config)
             if collectors:
