@@ -2,13 +2,17 @@
 """
 Post-restructure verification for the PrepareData API.
 
-Two phases:
+Three phases:
   1. Functional smoke tests — one request per route, checking each piece
      touched by the restructure actually still works end to end (auth
      bootstrap, health, query, tables, the new API-key validation cache).
   2. The original concurrent load test (unchanged behavior), so you can
      confirm throughput/correctness didn't regress alongside the
      structural changes.
+  3. Report assembly — every result from phases 1-2, plus (optionally)
+     the server's own `/debug/performance` snapshot taken right after
+     the load test, is written to one timestamped JSON file for
+     API-optimization analysis. See `build_report` / `--output`.
 
 Requires: httpx   ->   pip install httpx
 
@@ -17,14 +21,21 @@ Usage:
     python load_test.py --smoke-only           # just phase 1
     python load_test.py --load-only --api-key YOUR_KEY
     python load_test.py --concurrency 200 --sql "SELECT 1"
+    python load_test.py --output my_run.json
+    python load_test.py --dashboard-api-key ADMIN_KEY   # attach server-side
+                                                         # /debug/performance
+                                                         # snapshot to the report
 """
 
 import argparse
 import asyncio
+import json
 import secrets
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -280,42 +291,82 @@ def percentile(data: list, pct: float) -> float:
     return data[f] + (data[c] - data[f]) * (k - f)
 
 
-def print_load_report(results: list, total_wall_time: float, concurrency: int):
+def build_load_report(
+    results: list[RequestResult], total_wall_time: float, concurrency: int, sql: str
+) -> dict:
+    """Turn raw per-request results into the JSON-serializable summary
+    that both `print_load_report` and `build_report` (the on-disk JSON)
+    read from — one computation, two consumers, so the printed numbers
+    and the saved numbers can never drift apart.
+    """
     latencies = [r.elapsed_ms for r in results]
     ok = [r for r in results if r.status_code == 200 and not r.error]
     failed = [r for r in results if r not in ok]
 
-    print("\n" + "=" * 60)
-    print(f"Phase 2: load test — {len(results)} requests, concurrency={concurrency}")
-    print("=" * 60)
-    print(f"Wall time:           {total_wall_time:.2f}s")
-    print(f"Throughput:          {len(results) / total_wall_time:.1f} req/s")
-    print(f"Succeeded (200):     {len(ok)}")
-    print(f"Failed:              {len(failed)}")
-    print("-" * 60)
-    print(
-        f"Latency min/avg/max: {min(latencies):.1f} / "
-        f"{statistics.mean(latencies):.1f} / {max(latencies):.1f} ms"
-    )
-    print(
-        f"Latency p50/p95/p99: {percentile(latencies, 50):.1f} / "
-        f"{percentile(latencies, 95):.1f} / {percentile(latencies, 99):.1f} ms"
-    )
+    status_counts: dict[str, int] = {}
+    for r in results:
+        key = str(r.status_code) if r.status_code else "connection_error"
+        status_counts[key] = status_counts.get(key, 0) + 1
 
-    if failed:
+    return {
+        "sql": sql,
+        "concurrency": concurrency,
+        "total_requests": len(results),
+        "wall_time_seconds": total_wall_time,
+        "throughput_req_per_sec": len(results) / total_wall_time if total_wall_time else 0.0,
+        "succeeded": len(ok),
+        "failed": len(failed),
+        "status_code_counts": status_counts,
+        "latency_ms": {
+            "min": min(latencies) if latencies else 0.0,
+            "avg": statistics.mean(latencies) if latencies else 0.0,
+            "max": max(latencies) if latencies else 0.0,
+            "p50": percentile(latencies, 50),
+            "p95": percentile(latencies, 95),
+            "p99": percentile(latencies, 99),
+        },
+        "sample_failures": [
+            {
+                "status_code": r.status_code,
+                "detail": r.error
+                or (r.body.get("error") if isinstance(r.body, dict) else r.body),
+            }
+            for r in failed[:10]
+        ],
+        "raw_requests": [
+            {"status_code": r.status_code, "elapsed_ms": r.elapsed_ms, "error": r.error}
+            for r in results
+        ],
+    }
+
+
+def print_load_report(load_report: dict):
+    print("\n" + "=" * 60)
+    print(
+        f"Phase 2: load test — {load_report['total_requests']} requests, "
+        f"concurrency={load_report['concurrency']}"
+    )
+    print("=" * 60)
+    print(f"Wall time:           {load_report['wall_time_seconds']:.2f}s")
+    print(f"Throughput:          {load_report['throughput_req_per_sec']:.1f} req/s")
+    print(f"Succeeded (200):     {load_report['succeeded']}")
+    print(f"Failed:              {load_report['failed']}")
+    print("-" * 60)
+    lat = load_report["latency_ms"]
+    print(f"Latency min/avg/max: {lat['min']:.1f} / {lat['avg']:.1f} / {lat['max']:.1f} ms")
+    print(f"Latency p50/p95/p99: {lat['p50']:.1f} / {lat['p95']:.1f} / {lat['p99']:.1f} ms")
+
+    if load_report["sample_failures"]:
         print("-" * 60)
         print("Sample failures (up to 10):")
-        for r in failed[:10]:
-            detail = r.error or (
-                r.body.get("error") if isinstance(r.body, dict) else r.body
-            )
-            print(f"  status={r.status_code}  detail={detail}")
+        for f in load_report["sample_failures"]:
+            print(f"  status={f['status_code']}  detail={f['detail']}")
     print("=" * 60 + "\n")
 
 
 async def run_load_test(
     client: httpx.AsyncClient, base_url: str, api_key: str, concurrency: int, sql: str
-):
+) -> dict:
     print(f"Firing {concurrency} concurrent requests: {sql!r}")
     start = time.perf_counter()
     tasks = [
@@ -323,7 +374,79 @@ async def run_load_test(
     ]
     results = await asyncio.gather(*tasks)
     total_wall_time = time.perf_counter() - start
-    print_load_report(results, total_wall_time, concurrency)
+    load_report = build_load_report(results, total_wall_time, concurrency, sql)
+    print_load_report(load_report)
+    return load_report
+
+
+# ---------------------------------------------------------------------
+# Phase 3: server-side performance snapshot + JSON report assembly
+# ---------------------------------------------------------------------
+
+
+async def fetch_dashboard_snapshot(
+    client: httpx.AsyncClient, base_url: str, dashboard_api_key: str
+) -> dict:
+    """Pull the server's own `/debug/performance` JSON right after the
+    load test: per-stage trace timing, pool/gauge state, and recent
+    request history straight from `core.performance`'s registry — the
+    piece client-side wall-clock timing alone can't show (which stage
+    inside the request actually cost the time). Requires an *admin*
+    key (`install_performance_dashboard`'s `require_admin_user` gate),
+    which the auto-registered load-test user is not, so this is opt-in
+    via `--dashboard-api-key` rather than reusing `api_key`.
+    """
+    try:
+        r = await client.get(
+            f"{base_url}/debug/performance",
+            headers={"x-api-key": dashboard_api_key},
+        )
+        if r.status_code != 200:
+            return {
+                "available": False,
+                "reason": f"status={r.status_code} body={r.text[:300]}",
+            }
+        return {"available": True, "data": r.json()}
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
+def build_report(
+    *,
+    args: argparse.Namespace,
+    smoke_results: Optional[list[CheckResult]],
+    load_report: Optional[dict],
+    dashboard_snapshot: Optional[dict],
+) -> dict:
+    """Assemble everything collected this run into one JSON-serializable dict."""
+    report: dict = {
+        "run_metadata": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "base_url": args.base_url,
+            "concurrency": args.concurrency,
+            "sql": args.sql,
+            "smoke_only": args.smoke_only,
+            "load_only": args.load_only,
+        },
+    }
+    if smoke_results is not None:
+        report["smoke_tests"] = {
+            "checks": [asdict(r) for r in smoke_results],
+            "passed": sum(1 for r in smoke_results if r.passed),
+            "total": len(smoke_results),
+        }
+    if load_report is not None:
+        if args.no_raw_requests:
+            load_report = {k: v for k, v in load_report.items() if k != "raw_requests"}
+        report["load_test"] = load_report
+    if dashboard_snapshot is not None:
+        report["server_performance_snapshot"] = dashboard_snapshot
+    return report
+
+
+def save_report(report: dict, output_path: Path) -> None:
+    output_path.write_text(json.dumps(report, indent=2, default=str))
+    print(f"Saved full report to: {output_path.resolve()}")
 
 
 # ---------------------------------------------------------------------
@@ -333,7 +456,8 @@ async def run_load_test(
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Verify the restructured API end to end, then load test it."
+        description="Verify the restructured API end to end, load test it, "
+        "and save a JSON report for API-optimization analysis."
     )
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(
@@ -368,6 +492,28 @@ async def main():
     parser.add_argument(
         "--load-only", action="store_true", help="Run only the concurrent load test."
     )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Path to save the JSON report. Defaults to "
+        "load_test_report_<UTC timestamp>.json in the current directory.",
+    )
+    parser.add_argument(
+        "--dashboard-api-key",
+        default=None,
+        help="Admin-scoped x-api-key. If given, GET /debug/performance is "
+        "fetched after the load test and attached to the JSON report as "
+        "'server_performance_snapshot' (per-stage timing, pool/gauge state). "
+        "Requires PERF_ENABLED=1 on the server and an admin API key — see "
+        "docs/performance/configuration.md and bootstrap_admin.py.",
+    )
+    parser.add_argument(
+        "--no-raw-requests",
+        action="store_true",
+        help="Exclude the full per-request array from the saved JSON, keeping "
+        "only aggregate stats (smaller file for very high concurrency runs).",
+    )
     args = parser.parse_args()
 
     if not args.username or not args.email:
@@ -380,6 +526,10 @@ async def main():
         max_keepalive_connections=args.concurrency,
     )
     timeout = httpx.Timeout(60.0)
+
+    smoke_results: Optional[list[CheckResult]] = None
+    load_report: Optional[dict] = None
+    dashboard_snapshot: Optional[dict] = None
 
     async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
         api_key = args.api_key
@@ -401,13 +551,32 @@ async def main():
                 client, args.base_url, api_key, user_id or ""
             )
             print_smoke_report(smoke_results)
-            if args.smoke_only:
-                return
 
         if not args.smoke_only:
-            await run_load_test(
+            load_report = await run_load_test(
                 client, args.base_url, api_key, args.concurrency, args.sql
             )
+
+        if args.dashboard_api_key:
+            print("Fetching server-side /debug/performance snapshot...")
+            dashboard_snapshot = await fetch_dashboard_snapshot(
+                client, args.base_url, args.dashboard_api_key
+            )
+            if not dashboard_snapshot["available"]:
+                print(f"  (unavailable: {dashboard_snapshot['reason']})")
+
+    report = build_report(
+        args=args,
+        smoke_results=smoke_results,
+        load_report=load_report,
+        dashboard_snapshot=dashboard_snapshot,
+    )
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_path = Path(f"load_test_report_{ts}.json")
+    save_report(report, output_path)
 
 
 if __name__ == "__main__":
