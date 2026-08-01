@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.bak
+# Virtual environments
+.venv
+
+.vscode/
+*.docx
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.gitattributes
+tests/
+legacy_files_backup/
+.github/
+.ipynb_checkpoints/
+.aiexclude
+GEMINI.MD
+.python-version
+docker-compose.otel.yml
+quickstart.sh
+setup_opentelemetry.py
+requirements-otel.txt
+MIGRATION.md
+duckdb_probe.py
+data/
+experimental/
+data/mydatabase.duckdb
