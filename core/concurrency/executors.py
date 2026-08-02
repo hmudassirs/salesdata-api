@@ -36,6 +36,7 @@ tests).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -76,12 +77,24 @@ class _TrackedExecutor:
 
     async def run(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
         loop = asyncio.get_running_loop()
+        # `loop.run_in_executor` does NOT propagate contextvars into the
+        # worker thread the way `asyncio.to_thread` does -- it just
+        # submits a plain callable to the pool. Without this, anything
+        # relying on a contextvar set in the calling coroutine (e.g.
+        # `core.performance.context.bind_profiler`, which
+        # `InstrumentedSQLAdapter` reads via `get_current_profiler()`)
+        # silently sees no context in the worker thread, and every
+        # `execute`/`fetch_one`/`fetch_all` call goes untimed -- its
+        # cost still happens, it just never shows up as its own
+        # `sql_execute`/`sql_fetch` stage and gets absorbed into the
+        # caller's outer stage instead. Running `fn` through a copy of
+        # the current context restores that propagation explicitly.
+        ctx = contextvars.copy_context()
+        call = functools.partial(ctx.run, fn, *args, **kwargs)
         with self._lock:
             self._active += 1
         try:
-            return await loop.run_in_executor(
-                self._executor, functools.partial(fn, *args, **kwargs)
-            )
+            return await loop.run_in_executor(self._executor, call)
         finally:
             with self._lock:
                 self._active -= 1
