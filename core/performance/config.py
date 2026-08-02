@@ -40,6 +40,18 @@ class PerformanceConfig:
     collect_asyncio: bool = False
     collect_process: bool = False
 
+    # --- Adaptive sampling (roadmap Phase 11 / P1-4) ---
+    # When True, `core.performance.adaptive_sampler.AdaptiveSampler`
+    # drives the sampling decision instead of the fixed
+    # `sample_rate_percent` above -- see that module's docstring for
+    # what "adaptive" means here and its honest limitations.
+    adaptive_sampling: bool = False
+    target_samples_per_second: float = 5.0
+    min_sample_rate_percent: float = 1.0
+    max_sample_rate_percent: float = 100.0
+    slow_request_threshold_seconds: float = 2.0
+    escalation_seconds: float = 30.0
+
     def __post_init__(self) -> None:
         """Validate configuration values at construction time."""
         if not PERCENT_MINIMUM <= self.sample_rate_percent <= PERCENT_MAXIMUM:
@@ -78,6 +90,18 @@ class PerformanceConfig:
                 ENV_MAX_REQUEST_HISTORY,
                 DEFAULT_MAX_REQUEST_HISTORY,
             ),
+            adaptive_sampling=_read_bool("PERF_ADAPTIVE_SAMPLING", False),
+            target_samples_per_second=_read_float(
+                "PERF_TARGET_SAMPLES_PER_SECOND", 5.0
+            ),
+            min_sample_rate_percent=_read_float("PERF_MIN_SAMPLE_RATE_PERCENT", 1.0),
+            max_sample_rate_percent=_read_float(
+                "PERF_MAX_SAMPLE_RATE_PERCENT", 100.0
+            ),
+            slow_request_threshold_seconds=_read_float(
+                "PERF_SLOW_REQUEST_THRESHOLD_SECONDS", 2.0
+            ),
+            escalation_seconds=_read_float("PERF_ESCALATION_SECONDS", 30.0),
         )
 
 
@@ -101,3 +125,13 @@ def _read_int(name: str, default: int) -> int:
         return int(value)
     except ValueError as error:
         raise PerformanceConfigurationError(f"{name} must be an integer") from error  # noqa: TRY003
+
+
+def _read_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as error:
+        raise PerformanceConfigurationError(f"{name} must be a number") from error  # noqa: TRY003

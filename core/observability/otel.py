@@ -2,7 +2,7 @@
 
 This module provides OpenTelemetry integration for the application, enabling:
 - Distributed tracing across service boundaries
-- Standardized metrics collection (Prometheus compatible)
+- Standardized metrics collection, pushed to an OTel Collector via OTLP
 - Span context propagation
 - Log correlation with traces and metrics
 
@@ -20,6 +20,21 @@ Fixed by wiring `get_otel_manager().initialize()` into
 core/app/lifespan.py's startup and having session.py obtain its tracer
 through this manager instead of calling `opentelemetry.trace` directly
 — see both files' diffs in MIGRATION.md.
+
+METRICS FIX (see docs/performance/collectors-exporters-dashboard.md
+discussion): this used to build its meter provider around
+`PrometheusMetricReader`, a *pull*-based reader. That reader only
+registers instruments with `prometheus_client`'s global registry — it
+never sends anything anywhere, and nothing in this codebase ever called
+`prometheus_client.start_http_server(...)` or mounted a `/metrics` ASGI
+route, so there was no scrape endpoint for it either. Combined with an
+`otel-config.yaml` collector configured with an `otlp` *receiver* (not a
+`prometheus` scrape target), metrics never reached the collector at all
+— only traces did, via `OTLPSpanExporter`. Metrics now push over OTLP
+too, via `OTLPMetricExporter` + `PeriodicExportingMetricReader`, using
+the same collector endpoint traces already use. `record_metric` also
+used to just log a debug line instead of touching `self.meter` at all;
+it now creates and updates a real OTel `Counter` per metric name.
 """
 
 import logging
@@ -29,9 +44,10 @@ from functools import wraps
 from typing import Any, Callable, Optional
 
 from opentelemetry import metrics, trace
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -49,6 +65,7 @@ class OpenTelemetryManager:
         otlp_insecure: bool = True,
         enable_prometheus: bool = True,
         enable_otlp: bool = True,
+        metric_export_interval_millis: int = 5000,
     ):
         """Initialize OpenTelemetry manager.
 
@@ -59,24 +76,41 @@ class OpenTelemetryManager:
                 modern Jaeger (which accepts OTLP natively as of Jaeger 1.35+,
                 so this can still point at a Jaeger instance). Can also be
                 left at the default and overridden via the standard
-                `OTEL_EXPORTER_OTLP_ENDPOINT` env var, which `OTLPSpanExporter`
-                reads itself if `endpoint` isn't passed explicitly.
+                `OTEL_EXPORTER_OTLP_ENDPOINT` env var, which the OTLP
+                exporters read themselves if `endpoint` isn't passed
+                explicitly.
             otlp_insecure: Skip TLS for the gRPC channel (default True for
                 local/sidecar collectors; set False for a collector requiring
                 TLS, e.g. behind a public endpoint).
-            enable_prometheus: Enable Prometheus metrics export
+            enable_prometheus: Enable metrics export. The name is kept for
+                backwards compatibility with existing config/call sites;
+                what it now controls is whether metrics are pushed via
+                OTLP so they end up Prometheus-exposition-formatted at the
+                collector's own `/metrics` endpoint (see otel-config.yaml's
+                `prometheus` exporter) rather than scraped from this
+                process directly.
             enable_otlp: Enable OTLP trace export
+            metric_export_interval_millis: How often the metric reader
+                flushes to the collector. Lower values show data sooner
+                at the cost of more frequent export calls.
         """
         self.service_name = service_name
         self.otlp_endpoint = otlp_endpoint
         self.otlp_insecure = otlp_insecure
         self.enable_prometheus = enable_prometheus
         self.enable_otlp = enable_otlp
+        self.metric_export_interval_millis = metric_export_interval_millis
 
         self.tracer_provider: Optional[TracerProvider] = None
         self.meter_provider: Optional[MeterProvider] = None
         self.tracer: Optional[trace.Tracer] = None
         self.meter: Optional[metrics.Meter] = None
+
+        # Backing store for record_metric()'s counters — keyed by metric
+        # name, since a single OTel Counter instrument can be reused for
+        # every call to that name (attributes vary per-call, the
+        # instrument itself doesn't).
+        self._counters: dict[str, Any] = {}
 
     def initialize(self) -> None:
         """Initialize OpenTelemetry providers."""
@@ -101,9 +135,9 @@ class OpenTelemetryManager:
                 self.tracer_provider.add_span_processor(
                     BatchSpanProcessor(otlp_exporter)
                 )
-                logger.info(f"OTLP exporter enabled: {self.otlp_endpoint}")
+                logger.info(f"OTLP trace exporter enabled: {self.otlp_endpoint}")
             except Exception as e:
-                logger.warning(f"Failed to initialize OTLP exporter: {e}")
+                logger.warning(f"Failed to initialize OTLP trace exporter: {e}")
 
         trace.set_tracer_provider(self.tracer_provider)
         self.tracer = trace.get_tracer(__name__)
@@ -111,14 +145,25 @@ class OpenTelemetryManager:
         # Initialize Meter Provider
         readers = []
 
-        # Add Prometheus reader if enabled
-        if self.enable_prometheus:
+        # Push metrics over OTLP to the same collector traces go to,
+        # instead of the old pull-based PrometheusMetricReader (which had
+        # no scrape endpoint wired up anywhere and, separately, didn't
+        # match the collector's `otlp` receiver config).
+        if self.enable_prometheus and self.enable_otlp:
             try:
-                prometheus_reader = PrometheusMetricReader()
-                readers.append(prometheus_reader)
-                logger.info("Prometheus metrics export enabled")
+                otlp_metric_exporter = OTLPMetricExporter(
+                    endpoint=self.otlp_endpoint,
+                    insecure=self.otlp_insecure,
+                )
+                readers.append(
+                    PeriodicExportingMetricReader(
+                        otlp_metric_exporter,
+                        export_interval_millis=self.metric_export_interval_millis,
+                    )
+                )
+                logger.info(f"OTLP metric exporter enabled: {self.otlp_endpoint}")
             except Exception as e:
-                logger.warning(f"Failed to initialize Prometheus: {e}")
+                logger.warning(f"Failed to initialize OTLP metric exporter: {e}")
 
         self.meter_provider = MeterProvider(resource=resource, metric_readers=readers)
         metrics.set_meter_provider(self.meter_provider)
@@ -165,19 +210,22 @@ class OpenTelemetryManager:
         value: float,
         attributes: Optional[dict[str, str]] = None,
     ) -> None:
-        """Record a metric value.
+        """Record a metric value as an OTel counter.
 
         Args:
             metric_name: Name of the metric
-            value: Metric value
+            value: Metric value to add to the counter
             attributes: Optional metric attributes
         """
         if not self.meter:
             return
 
-        # This would typically use a counter, histogram, or gauge
-        # For now, we'll log the metric
-        logger.debug(f"Metric {metric_name}: {value}")
+        counter = self._counters.get(metric_name)
+        if counter is None:
+            counter = self.meter.create_counter(metric_name)
+            self._counters[metric_name] = counter
+
+        counter.add(value, attributes=attributes or {})
 
     def create_tracer(self, name: str) -> trace.Tracer:
         """Create a tracer for a module.

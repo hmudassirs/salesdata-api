@@ -27,7 +27,7 @@ class _AsyncPoolLike(Protocol):
 
     async def acquire(self) -> Any: ...
 
-    async def release(self, conn: Any) -> None: ...
+    async def release(self, conn: Any, *, broken: bool = False) -> None: ...
 
     async def close_all(self) -> None: ...
 
@@ -39,7 +39,7 @@ class _SyncPoolLike(Protocol):
 
     def acquire(self) -> Any: ...
 
-    def release(self, conn: Any) -> None: ...
+    def release(self, conn: Any, *, broken: bool = False) -> None: ...
 
     def close_all(self) -> None: ...
 
@@ -80,16 +80,16 @@ class AsyncPoolTimingAdapter:
         _emit_pool_gauges(profiler, self._pool.metrics())
         return conn
 
-    async def release(self, conn: Any) -> None:
+    async def release(self, conn: Any, *, broken: bool = False) -> None:
         """Return a connection to the pool, timing it under `POOL_RELEASE`."""
         profiler = get_current_profiler()
         if profiler is None:
-            await self._pool.release(conn)
+            await self._pool.release(conn, broken=broken)
             return
         with profiler.stage(
             PerformanceStage.POOL_RELEASE, MetricName("pool_release")
         ):
-            await self._pool.release(conn)
+            await self._pool.release(conn, broken=broken)
         _emit_pool_gauges(profiler, self._pool.metrics())
 
     async def close_all(self) -> None:
@@ -121,16 +121,16 @@ class SyncPoolTimingAdapter:
         _emit_pool_gauges(profiler, self._pool.metrics())
         return conn
 
-    def release(self, conn: Any) -> None:
+    def release(self, conn: Any, *, broken: bool = False) -> None:
         """Return a connection to the pool, timing it under `POOL_RELEASE`."""
         profiler = get_current_profiler()
         if profiler is None:
-            self._pool.release(conn)
+            self._pool.release(conn, broken=broken)
             return
         with profiler.stage(
             PerformanceStage.POOL_RELEASE, MetricName("pool_release")
         ):
-            self._pool.release(conn)
+            self._pool.release(conn, broken=broken)
         _emit_pool_gauges(profiler, self._pool.metrics())
 
     def close_all(self) -> None:

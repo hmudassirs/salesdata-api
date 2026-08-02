@@ -78,6 +78,21 @@ def create_app(
     """
     settings = settings or AppSettings.from_env()
 
+    # Size the Phase-14 concurrency semaphores and Phase-13.4 result/
+    # duration limits from settings, same pattern as run_api.py's
+    # configure_executors() call -- one process-wide configuration
+    # point, called once, before any request can reach QueryService.
+    from core.services.query_limits import configure_query_limits
+
+    configure_query_limits(
+        max_result_rows=settings.max_result_rows,
+        max_result_bytes=settings.max_result_bytes,
+        max_query_duration_seconds=settings.max_query_duration_seconds,
+        fast_concurrency=settings.fast_query_concurrency_limit,
+        normal_concurrency=settings.normal_query_concurrency_limit,
+        expensive_concurrency=settings.expensive_query_concurrency_limit,
+    )
+
     app = FastAPI(
         title=title,
         version=version,

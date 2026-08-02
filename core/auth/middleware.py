@@ -8,6 +8,8 @@ records what happened after.
 """
 
 import asyncio
+
+from core.concurrency.executors import run_in_service_executor
 import time
 
 import jwt
@@ -120,6 +122,11 @@ def install_auth_middleware(app: FastAPI) -> None:
                     request.state.user_id = owner_id
                     request.state.username = ""
                     request.state.role = ""
+                    # API keys carry their own scopes (e.g. "read,write"),
+                    # independent of the owning user's role -- see
+                    # core.db.sql_policy.has_scope for how routes use
+                    # this to gate mutating statements.
+                    request.state.scopes = validated_key.get("scopes", "") or ""
                     request.state.session_id = (
                         request.headers.get("x-session-id", "") or "api-key"
                     )
@@ -127,7 +134,7 @@ def install_auth_middleware(app: FastAPI) -> None:
                     if owner_id and hasattr(service_manager, "users"):
                         user = _get_cached_user(owner_id)
                         if user is None:
-                            user = await asyncio.to_thread(
+                            user = await run_in_service_executor(
                                 service_manager.users.get_by_id, owner_id
                             )
                             if user:
@@ -167,6 +174,16 @@ def install_auth_middleware(app: FastAPI) -> None:
                         request.state.user_id = payload.get("user_id", "")
                         request.state.username = payload.get("username", "")
                         request.state.role = payload.get("role", "")
+                        # JWT sessions have no independent scopes concept
+                        # (unlike API keys) -- derive an equivalent from
+                        # role instead: admins get full access, everyone
+                        # else is read-only until they mint a
+                        # write-scoped API key. See core.db.sql_policy.
+                        request.state.scopes = (
+                            "read,write"
+                            if payload.get("role") == "admin"
+                            else "read"
+                        )
                         request.state.session_id = (
                             request.headers.get("x-session-id", "") or "jwt"
                         )

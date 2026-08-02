@@ -16,12 +16,14 @@ class CurrentUser:
     """Identity of the caller, as resolved by the API-key/JWT middleware
     in core.auth.middleware.
 
-    Bundles `user_id` and `role` together so routes depend on one typed
-    object instead of pulling loose values off `request.state` by name.
+    Bundles `user_id`, `role`, and `scopes` together so routes depend on
+    one typed object instead of pulling loose values off `request.state`
+    by name.
     """
 
     user_id: str
     role: str
+    scopes: str = ""
 
     @property
     def is_admin(self) -> bool:
@@ -30,7 +32,7 @@ class CurrentUser:
 
 def get_current_user(request: Request) -> CurrentUser:
     """Return the caller's identity, set on request.state by
-    core.auth.middleware (`request.state.user_id` / `.role`).
+    core.auth.middleware (`request.state.user_id` / `.role` / `.scopes`).
 
     Routes should authorize against this instead of trusting a
     client-supplied owner_id/user_id in the path or body.
@@ -38,6 +40,7 @@ def get_current_user(request: Request) -> CurrentUser:
     return CurrentUser(
         user_id=getattr(request.state, "user_id", "") or "",
         role=getattr(request.state, "role", "") or "",
+        scopes=getattr(request.state, "scopes", "") or "",
     )
 
 

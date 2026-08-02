@@ -1,5 +1,7 @@
 """Persistent cache of /api/query SELECT results. Renamed from the old `QueryCacheService` to avoid colliding with core.db.cache's LRU/TTL in-memory QueryCache classes, an unrelated in-process utility with the exact same 'cache' name."""
 
+import datetime
+import decimal
 import hashlib
 import json
 import time
@@ -9,6 +11,24 @@ from core.db.logger import get_logger
 from core.storage.service_db import ServiceDatabase
 
 logger = get_logger(__name__)
+
+
+def _json_default(value: Any) -> Any:
+    """`json.dumps(default=...)` hook for types SQL drivers commonly
+    hand back that the stdlib encoder doesn't know: dates/times (ISO
+    format) and Decimals (as float, since cached results are read-only
+    display data, not something re-parsed for further arithmetic).
+    Without this, caching the result of any query touching a DATE,
+    TIMESTAMP, or DECIMAL/NUMERIC column raised "Object of type date is
+    not JSON serializable" out of `cache_result()` (and, since that call
+    used to happen inline, out of whatever background task called it)."""
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return float(value)
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="replace")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 class QueryResultCache:
@@ -39,6 +59,15 @@ class QueryResultCache:
     def get_cached_result(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """Get cached query result.
 
+        Note: this used to also issue a synchronous
+        `UPDATE query_cache SET last_accessed_at ...` on every hit,
+        inline with the read. That makes every cache *hit* pay for a
+        SQLite write before the caller can proceed -- exactly the
+        "cache-hit traffic generating synchronous writes" the roadmap
+        calls out (section 3, rule #3). Call `record_access()`
+        separately (ideally fire-and-forget, off the request path) if
+        you want that bookkeeping.
+
         Args:
             cache_key: Cache key
 
@@ -54,17 +83,24 @@ class QueryResultCache:
 
         try:
             result = self.service_db.fetch_one(sql, (cache_key, current_time))
-            if result:
-                # Update access statistics
-                self.service_db.execute(
-                    "UPDATE query_cache SET last_accessed_at = ?, access_count = access_count + 1 WHERE cache_key = ?",
-                    (current_time, cache_key),
-                )
-                return dict(result)
-            return None
+            return dict(result) if result else None
         except Exception as e:
             logger.error(f"Failed to get cached result: {e}")
             return None
+
+    def record_access(self, cache_key: str) -> None:
+        """Record a cache hit's access statistics. Split out of
+        `get_cached_result()` so callers can run this as fire-and-forget
+        background work instead of blocking the response on it -- see
+        that method's docstring."""
+        try:
+            current_time = int(time.time())
+            self.service_db.execute(
+                "UPDATE query_cache SET last_accessed_at = ?, access_count = access_count + 1 WHERE cache_key = ?",
+                (current_time, cache_key),
+            )
+        except Exception as e:
+            logger.error(f"Failed to record cache access: {e}")
 
     def cache_result(
         self,
@@ -95,8 +131,12 @@ class QueryResultCache:
         created_at = int(time.time())
         expires_at = created_at + ttl_seconds if ttl_seconds > 0 else None
 
-        # Serialize result data
-        result_json = json.dumps(result_data)
+        # Serialize result data. `default=_json_default` covers date/
+        # datetime/Decimal/bytes values that raw DB rows commonly
+        # contain and that json can't serialize on its own — this is
+        # what was throwing "Object of type date is not JSON
+        # serializable" here.
+        result_json = json.dumps(result_data, default=_json_default)
         result_size = len(result_json.encode())
 
         sql = """
@@ -127,6 +167,27 @@ class QueryResultCache:
         except Exception as e:
             logger.error(f"Failed to cache result: {e}")
             return cache_key
+
+    def clear_all(self) -> int:
+        """Delete every cached entry, unconditionally.
+
+        `invalidate_cache()` requires at least a pattern or user_id and
+        refuses to run with neither (by design -- an accidental
+        empty-args call there shouldn't wipe the whole cache). This is
+        the explicit, intentional "wipe everything" used after a write
+        statement executes, since QueryCacheCoordinator has no way to
+        know precisely which cached SELECTs a given INSERT/UPDATE/
+        DELETE/DDL statement could have affected (roadmap 16.3: "avoid
+        stale data after mutations" -- correctness over precision).
+        """
+        try:
+            result = self.service_db.execute("DELETE FROM query_cache", ())
+            deleted_count = result.rowcount
+            logger.info(f"Cleared entire query cache ({deleted_count} entries) after a write statement")
+            return deleted_count
+        except Exception as e:
+            logger.error(f"Failed to clear cache: {e}")
+            return 0
 
     def invalidate_cache(self, query_pattern: str = "", user_id: str = "") -> int:
         """Invalidate cache entries.

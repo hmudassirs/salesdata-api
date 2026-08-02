@@ -14,6 +14,7 @@ from typing import Any, Dict
 
 from core.auth.api_key_repository import APIKeyRepository
 from core.auth.user_repository import UserRepository
+from core.caching.query_cache_coordinator import QueryCacheCoordinator
 from core.caching.query_result_cache import QueryResultCache
 from core.db.logger import get_logger
 from core.observability.audit import AuditTrail
@@ -46,6 +47,12 @@ class ServiceManager:
         self.logging = RequestLogger(self.service_db)
         self.tracing = RequestTracer(self.service_db)
         self.caching = QueryResultCache(self.service_db)
+        # L1 in-process cache + single-flight coalescing in front of
+        # `self.caching` (the L2/SQLite cache) -- see
+        # query_cache_coordinator.py's module docstring. Routes should
+        # go through this, not `self.caching` directly, for anything on
+        # the request hot path.
+        self.query_cache = QueryCacheCoordinator(self.caching)
         self.audit = AuditTrail(self.service_db)
         # Set by ApplicationLifespan's ServiceDatabaseStep after construction,
         # once the background flush thread is actually running. None here

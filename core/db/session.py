@@ -41,7 +41,7 @@ import core.db.adapters  # noqa: F401 — side effect: each adapter module
 # never imports DuckDBAdapter/SQLiteAdapter by name — see _create_adapter().
 from core.db.config import DatabaseConfig, DatabaseType
 from core.db.pool import AsyncConnectionPool, SyncConnectionPool
-from core.db.pool.base import MaxConnectionsExceeded
+from core.db.pool.base import MaxConnectionsExceeded, is_connection_level_error
 from core.db.registry import get_adapter_registry
 
 # Optional core.performance integration: pool acquire/release timing +
@@ -68,6 +68,12 @@ except Exception:
 
 logger = get_logger(__name__)
 
+# Dedicated bounded executor for DuckDB warehouse work -- see
+# core/concurrency/executors.py's module docstring for why this
+# replaced routing every blocking call through asyncio.to_thread's
+# single shared default executor (roadmap rule #5: no one oversized
+# global thread pool for unrelated workloads).
+from core.concurrency.executors import run_in_db_executor
 
 from core.db.protocols import DatabaseAdapter as DBAdapter
 
@@ -94,9 +100,9 @@ async def _run_in_thread(fn, *args):
         with _TRACER.start_as_current_span(span_name) as span:
             if args and isinstance(args[0], str):
                 span.set_attribute("db.statement", args[0][:200])
-            result = await asyncio.to_thread(fn, *args)
+            result = await run_in_db_executor(fn, *args)
     else:
-        result = await asyncio.to_thread(fn, *args)
+        result = await run_in_db_executor(fn, *args)
 
     elapsed = time.perf_counter() - start
     if APP_LATENCY is not None:
@@ -433,14 +439,33 @@ class DatabaseSession:
                 logger.debug("Failed to increment POOL_ACTIVE", exc_info=True)
 
         try:
+            broken_connection = False
             yield session
-        except Exception:
-            await session.rollback()
+        except Exception as exc:
+            # P1-1: a connection-level failure (transport/connection
+            # actually dead) must never go back to `_available` for the
+            # next caller to inherit -- only an ordinary query error
+            # (bad SQL, constraint violation) is safe to rollback and
+            # reuse the connection for. See
+            # core.db.pool.base.is_connection_level_error.
+            broken_connection = is_connection_level_error(exc)
+            if not broken_connection:
+                try:
+                    await session.rollback()
+                except Exception:
+                    # rollback() itself failing on a connection that
+                    # otherwise looked fine is itself a connection-level
+                    # signal -- treat it as broken rather than silently
+                    # swallowing and returning a connection that can't
+                    # even roll back.
+                    broken_connection = True
             raise
         finally:
             # Release and mark inactive
             try:
-                await self._async_pool_adapter.release(session)
+                await self._async_pool_adapter.release(
+                    session, broken=broken_connection
+                )
             finally:
                 if POOL_ACTIVE is not None:
                     try:
@@ -490,13 +515,19 @@ class DatabaseSession:
                 logger.debug("Failed to increment POOL_ACTIVE", exc_info=True)
 
         try:
+            broken_connection = False
             yield session
-        except Exception:
-            session.rollback()
+        except Exception as exc:
+            broken_connection = is_connection_level_error(exc)
+            if not broken_connection:
+                try:
+                    session.rollback()
+                except Exception:
+                    broken_connection = True
             raise
         finally:
             try:
-                self._sync_pool_adapter.release(session)
+                self._sync_pool_adapter.release(session, broken=broken_connection)
             finally:
                 if POOL_ACTIVE is not None:
                     try:

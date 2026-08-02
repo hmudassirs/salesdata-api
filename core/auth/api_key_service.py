@@ -5,6 +5,8 @@ core/auth/ alongside models.py/passwords.py with no way to tell which
 file did what without opening each one."""
 
 import asyncio
+
+from core.concurrency.executors import run_in_service_executor
 import hashlib
 import secrets
 import time
@@ -96,7 +98,7 @@ class APIKeyService:
         created_at = int(time.time())
 
         try:
-            await asyncio.to_thread(
+            await run_in_service_executor(
                 self.service_manager.api_keys.create,
                 key_id=key_id,
                 api_key_hash=api_key_hash,
@@ -147,7 +149,7 @@ class APIKeyService:
         now = int(time.time())
 
         try:
-            result = await asyncio.to_thread(
+            result = await run_in_service_executor(
                 self.service_manager.api_keys.validate, api_key_hash, now
             )
             if not result:
@@ -180,7 +182,7 @@ class APIKeyService:
             List of API key metadata (hashed keys)
         """
         try:
-            results = await asyncio.to_thread(
+            results = await run_in_service_executor(
                 self.service_manager.api_keys.list_by_owner, owner_id
             )
             return [
@@ -209,7 +211,7 @@ class APIKeyService:
             True if revoked, False if not found
         """
         try:
-            result = await asyncio.to_thread(
+            result = await run_in_service_executor(
                 self.service_manager.api_keys.revoke, key_id, owner_id
             )
             if result:
@@ -231,7 +233,7 @@ class APIKeyService:
             True if deleted, False if not found
         """
         try:
-            result = await asyncio.to_thread(
+            result = await run_in_service_executor(
                 self.service_manager.api_keys.delete, key_id, owner_id
             )
             if result:

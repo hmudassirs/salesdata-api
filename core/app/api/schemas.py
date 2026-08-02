@@ -1,7 +1,7 @@
 # core/app/api/schemas.py
 """Data models for API requests and responses."""
 
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -42,6 +42,14 @@ class QueryResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if failed")
     row_count: int = Field(0, description="Number of rows returned")
     cached: bool = Field(False, description="Whether result came from cache")
+    truncated: bool = Field(
+        False,
+        description=(
+            "True if the result was cut off by max_result_rows/"
+            "max_result_bytes -- row_count reflects the truncated size, "
+            "not the true result size"
+        ),
+    )
 
 
 class HealthResponse(BaseModel):
@@ -64,6 +72,41 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="Health status: 'healthy' or 'unhealthy'")
     db_connected: bool = Field(..., description="Whether database is connected")
     pool_metrics: Optional[dict] = Field(None, description="Pool metrics if available")
+    executor_metrics: Optional[dict] = Field(
+        None,
+        description=(
+            "Per-executor (db/service/background) active-worker and "
+            "approx-queue-depth counts -- roadmap P0-1"
+        ),
+    )
+    query_concurrency_metrics: Optional[dict] = Field(
+        None,
+        description=(
+            "Per-cost-class (fast/normal/expensive) query concurrency "
+            "semaphore usage -- roadmap Phase 14"
+        ),
+    )
+    cache_persistence_metrics: Optional[dict] = Field(
+        None,
+        description=(
+            "Bounded background cache-persistence queue depth/throughput "
+            "-- roadmap Phase 10"
+        ),
+    )
+    adaptive_sampler_metrics: Optional[dict] = Field(
+        None,
+        description=(
+            "Adaptive performance-sampling rate/escalation state -- "
+            "roadmap P1-4 (only present when PERF_ADAPTIVE_SAMPLING=true)"
+        ),
+    )
+    alerts: List[dict] = Field(
+        default_factory=list,
+        description=(
+            "Currently-firing operational alerts, evaluated against pool/"
+            "executor/concurrency/persistence/sampling metrics -- roadmap P1-5"
+        ),
+    )
 
 
 class TableInfo(BaseModel):

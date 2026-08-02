@@ -7,6 +7,7 @@ Usage:
 
 import asyncio
 import concurrent.futures
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -15,33 +16,39 @@ from fastapi import FastAPI
 
 from core.app.api.app import create_app
 from core.app.lifespan import ApplicationLifespan
+from core.concurrency.cpu import recommended_sizing
+from core.concurrency.executors import configure_executors
 from core.db.config import DatabaseConfig, DatabaseSettings
 from core.db.init_db import init_database
 from core.db.settings import PoolSettings
 
-# Python's asyncio.to_thread() dispatches into the event loop's default
-# executor, which — unless explicitly replaced — is a ThreadPoolExecutor
-# capped at min(32, os.cpu_count() + 4) workers. That cap is shared
-# across EVERY to_thread call in the entire process: every DuckDB query,
-# every SQLite service-db call, every observability emit. Under 500
-# concurrent requests each making 1-3 to_thread calls, that's up to
-# ~1000-1500 jobs competing for ~32 threads — a queue depth that shows
-# up directly as multi-second response latency, even though each
-# individual operation (confirmed via duckdb_probe.py) only costs tens
-# of milliseconds. Replacing the default executor with one sized for
-# real expected concurrency removes that artificial ceiling.
+# Historical note: this used to set ONE 300-worker default executor via
+# `asyncio.get_running_loop().set_default_executor(...)` and route every
+# blocking call in the process through it via `asyncio.to_thread`. That
+# fixed the immediate "only 32 threads for everything" ceiling, but still
+# left DuckDB warehouse queries, SQLite service-db calls (auth, query
+# cache), and fire-and-forget background writes all competing for the
+# same pool of threads -- a burst of slow warehouse queries could still
+# starve API-key validation, purely because they share a thread pool
+# that has nothing to do with either workload (roadmap rule #5: no one
+# oversized global thread pool for unrelated workloads).
 #
-# 300 is a starting point, not a law of physics — tune based on actual
-# expected peak concurrency and available memory (each thread reserves
-# stack space; thousands of workers is a different, worse problem).
-_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=300, thread_name_prefix="io-worker"
+# `configure_executors()` (core/concurrency/executors.py) replaces this
+# with three separate bounded pools -- db / service / background -- each
+# sized to the connection pool it actually fronts, so one workload's
+# load can't starve the others' threads. A small default executor is
+# still set for the handful of one-off startup/shutdown calls
+# (`core/app/lifespan.py`) and observability's synchronous fallback path
+# that don't go through any of the three dedicated executors.
+_DEFAULT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(4, recommended_sizing().cpu_count * 2),
+    thread_name_prefix="default-io-worker",
 )
 
 
 async def main():
     """Run FastAPI development server with proper lifecycle management."""
-    asyncio.get_running_loop().set_default_executor(_IO_EXECUTOR)
+    asyncio.get_running_loop().set_default_executor(_DEFAULT_EXECUTOR)
 
     project_root = Path(__file__).resolve().parent
     data_dir = project_root / "data"
@@ -59,13 +66,60 @@ async def main():
     # here except hand over the path.
     service_db_path = str(data_dir / "service.db")
 
-    pool_config = PoolSettings(min_size=2, max_size=10, timeout=30)
+    # Pool/executor sizes are derived from the actual CPU count available
+    # to this process (core/concurrency/cpu.py) rather than hardcoded --
+    # this used to be a flat `PoolSettings(min_size=2, max_size=10)`
+    # picked for whatever machine last ran the load test, which either
+    # starves a bigger box or oversubscribes a smaller one. Each
+    # individual number can still be overridden with an env var (e.g. for
+    # a production deployment that's benchmarked its own optimal size);
+    # what's dynamic is the *default* when nothing more specific is set.
+    sizing = recommended_sizing()
+    print(
+        f"🧮 Detected {sizing.cpu_count} usable CPU(s) -- deriving pool/executor "
+        f"sizes from that (override with env vars to pin explicit values)"
+    )
+
+    pool_min = int(os.getenv("DB_POOL_MIN_SIZE", str(sizing.db_pool_min)))
+    pool_max = int(os.getenv("DB_POOL_MAX_SIZE", str(sizing.db_pool_max)))
+    pool_config = PoolSettings(min_size=pool_min, max_size=pool_max, timeout=30)
     db_settings = DatabaseSettings(pool=pool_config)
     db_config = DatabaseConfig.from_duckdb(db_path, settings=db_settings)
 
+    service_pool_min = int(
+        os.getenv("SERVICE_DB_POOL_MIN_SIZE", str(sizing.service_pool_min))
+    )
+    service_pool_max = int(
+        os.getenv("SERVICE_DB_POOL_MAX_SIZE", str(sizing.service_pool_max))
+    )
+
+    # Size the DB/service executors off the *actual* pool configuration
+    # above, plus a little headroom for in-flight reservation
+    # bookkeeping -- there's no benefit to more worker threads than
+    # there are connections for them to use. `service_workers` covers
+    # ServiceDatabase's own pool (see core/storage/service_db.py).
+    configure_executors(
+        db_workers=int(
+            os.getenv("DB_EXECUTOR_WORKERS", str(pool_max + 2))
+        ),
+        service_workers=int(
+            os.getenv("SERVICE_EXECUTOR_WORKERS", str(service_pool_max + 2))
+        ),
+        background_workers=int(
+            os.getenv(
+                "BACKGROUND_EXECUTOR_WORKERS",
+                str(sizing.background_executor_workers),
+            )
+        ),
+    )
+
     # Create lifespan manager (async mode for pooled database access)
     lifespan_mgr = ApplicationLifespan(
-        db_config, service_db_path=service_db_path, mode="async"
+        db_config,
+        service_db_path=service_db_path,
+        mode="async",
+        service_pool_min_size=service_pool_min,
+        service_pool_max_size=service_pool_max,
     )
 
     # This runner is async-only: every route in core/app/api/routes.py is

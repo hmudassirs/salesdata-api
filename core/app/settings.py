@@ -33,6 +33,53 @@ class AppSettings:
     cors_allow_origins: tuple = ("*",)
     cors_allow_credentials: bool = False
 
+    # --- Query execution policy (roadmap Phase 13.1) ---
+    # This deployment is an intentional "authenticated DB console", not
+    # a read-only reporting API: callers are expected to run DDL/DML
+    # against their own warehouse, and there's no per-row/per-tenant
+    # data to leak between callers (single shared warehouse, no RLS
+    # concept anywhere in this codebase -- see QueryCacheCoordinator's
+    # docstring for the corresponding cache-isolation decision). Given
+    # that, the policy chosen here is: SELECT/WITH require only the
+    # "read" scope (or any authenticated caller, since read is always
+    # granted); write statements (INSERT/UPDATE/DELETE/DDL/etc.)
+    # require the "write" scope on the caller's API key, or an "admin"
+    # role for JWT-authenticated sessions (which have no scope concept
+    # of their own). See core/db/sql_policy.py.
+    require_write_scope_for_mutations: bool = True
+
+    # --- Query result limits (roadmap Phase 13.4) ---
+    # Protects one caller's unbounded SELECT from exhausting memory or
+    # the response pipeline. Rows beyond this are dropped and the
+    # response is flagged `truncated=True` rather than silently
+    # returning a partial result with no indication anything was cut.
+    max_result_rows: int = 10_000
+    # Same idea, but on serialized response size -- catches wide rows
+    # (many/large columns) that a row-count cap alone wouldn't.
+    max_result_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    # A query running longer than this is cancelled and reported as an
+    # error rather than left to run indefinitely and hold a pool
+    # connection open.
+    max_query_duration_seconds: float = 30.0
+
+    # --- Concurrency controls for expensive queries (roadmap Phase 14) ---
+    # Separate semaphores per query class so a handful of expensive
+    # aggregations/wide scans can't starve simple/fast queries of pool
+    # capacity. See core/db/sql_policy.py for classification and
+    # core/services/query_service.py for where these are applied.
+    # Intentionally >= pool max_size: these gate *how many callers can
+    # be mid-execution*, not how many DB connections exist -- the pool
+    # itself is still the hard ceiling on actual DB concurrency.
+    #
+    # None (the default) means "derive from the host's actual CPU count
+    # via core.concurrency.cpu.recommended_sizing()" instead of a
+    # constant picked for one machine -- resolved in from_env(). Pass an
+    # explicit int (or set the matching env var) to pin a fixed value
+    # instead, e.g. for a deployment that's benchmarked its own optimum.
+    fast_query_concurrency_limit: Optional[int] = None
+    normal_query_concurrency_limit: Optional[int] = None
+    expensive_query_concurrency_limit: Optional[int] = None
+
     @classmethod
     def from_env(cls) -> "AppSettings":
         """Create settings from environment variables.
@@ -75,6 +122,16 @@ class AppSettings:
                 "List explicit origins instead."
             )
 
+        # Resolve query-concurrency defaults from the host's actual CPU
+        # count (core/concurrency/cpu.py) unless an env var pins an
+        # explicit value -- see the field docstrings above.
+        from core.concurrency.cpu import recommended_sizing
+
+        sizing = recommended_sizing()
+        fast_limit = os.getenv("FAST_QUERY_CONCURRENCY_LIMIT")
+        normal_limit = os.getenv("NORMAL_QUERY_CONCURRENCY_LIMIT")
+        expensive_limit = os.getenv("EXPENSIVE_QUERY_CONCURRENCY_LIMIT")
+
         return cls(
             app_name=os.getenv("APP_NAME", "preparedata"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
@@ -88,6 +145,28 @@ class AppSettings:
             jwt_expiry_seconds=int(os.getenv("JWT_EXPIRY_SECONDS", "3600")),
             cors_allow_origins=cors_allow_origins,
             cors_allow_credentials=cors_allow_credentials,
+            require_write_scope_for_mutations=(
+                os.getenv("REQUIRE_WRITE_SCOPE_FOR_MUTATIONS", "true").lower()
+                == "true"
+            ),
+            max_result_rows=int(os.getenv("MAX_RESULT_ROWS", "10000")),
+            max_result_bytes=int(os.getenv("MAX_RESULT_BYTES", str(10 * 1024 * 1024))),
+            max_query_duration_seconds=float(
+                os.getenv("MAX_QUERY_DURATION_SECONDS", "30.0")
+            ),
+            fast_query_concurrency_limit=int(
+                fast_limit if fast_limit is not None else sizing.fast_query_concurrency
+            ),
+            normal_query_concurrency_limit=int(
+                normal_limit
+                if normal_limit is not None
+                else sizing.normal_query_concurrency
+            ),
+            expensive_query_concurrency_limit=int(
+                expensive_limit
+                if expensive_limit is not None
+                else sizing.expensive_query_concurrency
+            ),
         )
 
     def configure_logging(self) -> None:
