@@ -24,6 +24,7 @@ dependencies = [
     "starlette",
     "PyJWT",
     "httpx",
+    "orjson",
 ]
 
 [build-system]

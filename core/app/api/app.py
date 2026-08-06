@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import APIKeyHeader
+from fastapi.responses import ORJSONResponse
 
 from core.app.api.routes import auth_router, router
 from core.app.settings import AppSettings
@@ -94,6 +95,7 @@ def create_app(
     )
 
     app = FastAPI(
+        default_response_class=ORJSONResponse,
         title=title,
         version=version,
         description=description,

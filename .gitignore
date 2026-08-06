@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 .bak
+.env.dev
+.env
+load_test_report*.json
 # Virtual environments
 .venv
 
