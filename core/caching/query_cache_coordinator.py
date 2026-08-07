@@ -35,7 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Set
 
 from core.caching.persistence_queue import submit_persist_job
 from core.caching.query_result_cache import QueryResultCache
@@ -87,6 +87,14 @@ class QueryCacheCoordinator:
         # connection pool fix.
         self._lock = asyncio.Lock()
         self._inflight: Dict[str, "asyncio.Future[CacheLookupResult]"] = {}
+        # cache_key -> set of table names it was tagged with at cache
+        # time (from core.db.sql_policy.extract_tables), and the
+        # reverse index used by invalidate_tables() to find affected
+        # keys without scanning the whole cache. Guarded by `_lock`
+        # since it's mutated from both the read path (tagging on
+        # cache-fill) and the write path (invalidate_tables).
+        self._key_tables: Dict[str, Set[str]] = {}
+        self._table_keys: Dict[str, Set[str]] = {}
 
     def cache_key(self, sql: str, params: tuple) -> str:
         return self._l2.generate_cache_key(sql, params)
@@ -97,6 +105,7 @@ class QueryCacheCoordinator:
         run_query: Callable[[], Awaitable[list]],
         *,
         on_miss_persist: Optional[Callable[[list], Awaitable[None]]] = None,
+        tables: Optional[Set[str]] = None,
     ) -> CacheLookupResult:
         """Resolve `cache_key`, checking L1 then coalescing concurrent
         callers onto a single L2-check-then-execute, and finally falling
@@ -112,6 +121,10 @@ class QueryCacheCoordinator:
                 call was the one that actually executed the query --
                 lets the caller persist to L2 without adding latency to
                 this response.
+            tables: table names this query reads from (see
+                core.db.sql_policy.extract_tables), used to scope
+                invalidate_tables() to just the entries a later write
+                could have affected.
         """
         cached = self._l1.get(cache_key)
         if cached is not None:
@@ -132,7 +145,7 @@ class QueryCacheCoordinator:
             return await fut
 
         try:
-            result = await self._resolve(cache_key, run_query, on_miss_persist)
+            result = await self._resolve(cache_key, run_query, on_miss_persist, tables)
             if not fut.done():
                 fut.set_result(result)
             return result
@@ -150,11 +163,13 @@ class QueryCacheCoordinator:
         cache_key: str,
         run_query: Callable[[], Awaitable[list]],
         on_miss_persist: Optional[Callable[[list], Awaitable[None]]],
+        tables: Optional[Set[str]],
     ) -> CacheLookupResult:
         l2_row = await run_in_service_executor(self._l2.get_cached_result, cache_key)
         if l2_row:
             data = json.loads(l2_row["result_data"])
             self._l1.put(cache_key, data, ttl=self._l1_ttl_seconds)
+            await self._tag_tables(cache_key, tables)
             # Access-stat bookkeeping is a write; never do it
             # synchronously on the read path (roadmap rule #3), and
             # route it through the *bounded* persistence queue (roadmap
@@ -164,9 +179,18 @@ class QueryCacheCoordinator:
 
         data = await run_query()
         self._l1.put(cache_key, data, ttl=self._l1_ttl_seconds)
+        await self._tag_tables(cache_key, tables)
         if on_miss_persist is not None and data:
             submit_persist_job(on_miss_persist(data))
         return CacheLookupResult(data=data, source="miss")
+
+    async def _tag_tables(self, cache_key: str, tables: Optional[Set[str]]) -> None:
+        if not tables:
+            return
+        async with self._lock:
+            self._key_tables[cache_key] = set(tables)
+            for table in tables:
+                self._table_keys.setdefault(table, set()).add(cache_key)
 
     def invalidate(self, cache_key: str) -> None:
         """Drop an entry from L1 only. L2 invalidation is handled
@@ -176,11 +200,51 @@ class QueryCacheCoordinator:
 
     async def clear_all(self) -> None:
         """Drop every cached entry, L1 and L2, e.g. after a write
-        statement executes (roadmap 16.3). L1 is cleared inline (cheap,
-        in-process); L2 goes through the service executor since it's a
-        SQLite call."""
+        statement whose affected tables couldn't be determined
+        (roadmap 16.3). L1 is cleared inline (cheap, in-process); L2
+        goes through the service executor since it's a SQLite call."""
+        async with self._lock:
+            self._key_tables.clear()
+            self._table_keys.clear()
         self._l1.clear()
         await run_in_service_executor(self._l2.clear_all)
+
+    async def invalidate_tables(self, tables: Set[str]) -> bool:
+        """Invalidate only the cache entries tagged with one of `tables`.
+
+        A narrower alternative to `clear_all()` for the common case
+        where a write statement's affected table(s) can be resolved
+        (see core.db.sql_policy.extract_tables). L1 entries are dropped
+        directly via the reverse index built by `_tag_tables`; L2 falls
+        back to `QueryResultCache.invalidate_cache()`'s `LIKE`-based
+        `query_pattern` match per table, since L2 doesn't maintain the
+        same in-process index.
+
+        Returns:
+            True if invalidation was scoped to `tables` (caller should
+            NOT also call clear_all()). False if `tables` was empty or
+            matched nothing we're tracking -- the caller should treat
+            this as "couldn't narrow it" and fall back to clear_all()
+            for correctness.
+        """
+        if not tables:
+            return False
+
+        async with self._lock:
+            keys_to_drop: Set[str] = set()
+            for table in tables:
+                keys_to_drop |= self._table_keys.pop(table, set())
+            for key in keys_to_drop:
+                self._key_tables.pop(key, None)
+
+        if not keys_to_drop:
+            return False
+
+        for key in keys_to_drop:
+            self._l1.invalidate(key)
+        for table in tables:
+            await run_in_service_executor(self._l2.invalidate_cache, query_pattern=table)
+        return True
 
     async def persist_l2(
         self,

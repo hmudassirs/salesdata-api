@@ -80,6 +80,29 @@ class AppSettings:
     normal_query_concurrency_limit: Optional[int] = None
     expensive_query_concurrency_limit: Optional[int] = None
 
+    # --- Cache invalidation ---
+    # When True, a write statement invalidates only the cache entries
+    # for tables it plausibly touched (core.db.sql_policy.extract_tables),
+    # instead of clearing the entire query cache. Falls back to a full
+    # clear automatically whenever no table can be resolved from the
+    # statement. Flagged so a full clear-on-every-write can be restored
+    # (the previous, maximally-conservative behavior) if the heuristic
+    # ever misses a table reference in production.
+    cache_invalidation_precise: bool = True
+
+    # --- Auth rate limiting ---
+    # Basic in-process, per-IP sliding-window limiter on
+    # /api/auth/users/login and /api/auth/users/register (see
+    # core.auth.rate_limiter) -- both are unauthenticated endpoints, so
+    # they'd otherwise have no protection against credential stuffing
+    # or registration spam. Flagged off for deployments that already
+    # rate-limit at a reverse proxy/gateway layer. Per-process, like the
+    # other in-memory caches in this codebase: not shared across
+    # multiple workers/instances.
+    auth_rate_limit_enabled: bool = True
+    auth_rate_limit_max_attempts: int = 10
+    auth_rate_limit_window_seconds: float = 60.0
+
     @classmethod
     def from_env(cls) -> "AppSettings":
         """Create settings from environment variables.
@@ -133,7 +156,7 @@ class AppSettings:
         expensive_limit = os.getenv("EXPENSIVE_QUERY_CONCURRENCY_LIMIT")
 
         return cls(
-            app_name=os.getenv("APP_NAME", "preparedata"),
+            app_name=os.getenv("APP_NAME", "salesinfo-api"),
             debug=os.getenv("DEBUG", "false").lower() == "true",
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             database_url=os.getenv("DATABASE_URL"),
@@ -166,6 +189,18 @@ class AppSettings:
                 expensive_limit
                 if expensive_limit is not None
                 else sizing.expensive_query_concurrency
+            ),
+            cache_invalidation_precise=(
+                os.getenv("CACHE_INVALIDATION_PRECISE", "true").lower() == "true"
+            ),
+            auth_rate_limit_enabled=(
+                os.getenv("AUTH_RATE_LIMIT_ENABLED", "true").lower() == "true"
+            ),
+            auth_rate_limit_max_attempts=int(
+                os.getenv("AUTH_RATE_LIMIT_MAX_ATTEMPTS", "10")
+            ),
+            auth_rate_limit_window_seconds=float(
+                os.getenv("AUTH_RATE_LIMIT_WINDOW_SECONDS", "60.0")
             ),
         )
 

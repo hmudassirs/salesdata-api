@@ -599,6 +599,13 @@ class DatabaseSession:
             raise RuntimeError("Adapter not initialized")
         return await _run_in_thread(self._adapter.get_tables)
 
+    async def get_schema(self, table: str) -> list[dict]:
+        """Column info for `table`, off the event loop thread (same
+        reasoning as `get_tables()` above)."""
+        if not self._adapter:
+            raise RuntimeError("Adapter not initialized")
+        return await _run_in_thread(self._adapter.get_schema, table)
+
     # ------------------ shutdown ------------------
 
     async def close(self) -> None:

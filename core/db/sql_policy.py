@@ -9,10 +9,11 @@ restrictive/expensive option rather than the more permissive one):
 - `classify_operation()` -- roadmap Phase 13.1 ("read-only query API"
   vs "full DB console" decision). This deployment chose "DB console
   with scope-gated writes" -- see AppSettings.require_write_scope_for_mutations
-  for the reasoning. SELECT/WITH (which itself must eventually resolve
-  to a SELECT) are "read"; everything else -- INSERT, UPDATE, DELETE,
-  DDL, or anything unrecognized -- is "write", so an unrecognized
-  statement is never accidentally treated as safe-to-run-unscoped.
+  for the reasoning. SELECT/WITH is "read" *only* when no DML/DDL
+  keyword appears anywhere in the statement (see the writable-CTE note
+  below); everything else -- INSERT, UPDATE, DELETE, DDL, or anything
+  unrecognized -- is "write", so an unrecognized statement is never
+  accidentally treated as safe-to-run-unscoped.
 
 - `classify_cost()` -- roadmap Phase 14. A rough FAST/NORMAL/EXPENSIVE
   bucket used only to pick which concurrency semaphore a query waits
@@ -31,6 +32,30 @@ _LEADING_COMMENT_RE = re.compile(r"^\s*(--[^\n]*\n|/\*.*?\*/\s*)*", re.DOTALL)
 _FIRST_WORD_RE = re.compile(r"^\s*([A-Za-z]+)")
 
 _READ_KEYWORDS = {"SELECT", "WITH"}
+
+# Postgres/DuckDB (and, since 3.35, SQLite) support *writable* CTEs --
+# `WITH x AS (...) DELETE FROM orders ...` -- so a leading `WITH` does
+# NOT guarantee the statement is read-only. Without this check, a
+# caller holding only the "read" scope could smuggle a write past
+# classify_operation() by prefixing it with a trivial CTE. Any of
+# these keywords appearing anywhere in a `WITH`-led statement forces
+# it to "write" -- conservative by design, same as the rest of this
+# module.
+_WRITE_KEYWORDS_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|MERGE|REPLACE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
+# Table-name extraction for cache invalidation (see
+# core.caching.query_cache_coordinator.invalidate_tables). Purely
+# heuristic, same conservative spirit as the rest of this module: it
+# only needs to be reliable enough to *narrow* invalidation, since
+# callers fall back to a full cache clear whenever no table can be
+# resolved.
+_TABLE_REF_RE = re.compile(
+    r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
 
 # Any of these appearing (as whole words) anywhere in the statement
 # marks it as at least NORMAL cost; combinations push it to EXPENSIVE.
@@ -54,9 +79,33 @@ def _first_keyword(sql: str) -> str:
 
 
 def classify_operation(sql: str) -> Operation:
-    """Classify a statement as "read" (SELECT/WITH) or "write" (anything
-    else, including unrecognized/empty input -- deny-by-default)."""
-    return "read" if _first_keyword(sql) in _READ_KEYWORDS else "write"
+    """Classify a statement as "read" (SELECT, or WITH with no writable
+    CTE) or "write" (anything else, including unrecognized/empty input
+    -- deny-by-default).
+
+    A leading `WITH` is only "read" if no DML/DDL keyword appears
+    anywhere in the statement -- see the writable-CTE note above
+    `_WRITE_KEYWORDS_RE`.
+    """
+    keyword = _first_keyword(sql)
+    if keyword not in _READ_KEYWORDS:
+        return "write"
+    if keyword == "WITH" and _WRITE_KEYWORDS_RE.search(sql):
+        return "write"
+    return "read"
+
+
+def extract_tables(sql: str) -> set[str]:
+    """Best-effort set of table names referenced by `sql`.
+
+    Used to narrow query-cache invalidation to just the tables a write
+    statement could have affected, instead of always clearing the
+    whole cache. Deliberately conservative in the opposite direction
+    from the rest of this module: an empty/uncertain result should
+    make the *caller* fall back to a full cache clear, not silently
+    skip invalidation.
+    """
+    return {m.group(1) for m in _TABLE_REF_RE.finditer(sql or "")}
 
 
 def classify_cost(sql: str) -> Cost:

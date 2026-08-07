@@ -19,8 +19,9 @@ from core.app.api.dependencies import (
     GetSettings,
 )
 from core.app.settings import AppSettings
+from core.auth import rate_limiter
 from core.auth.api_key_service import APIKeyService
-from core.auth.middleware import invalidate_user_cache
+from core.auth.middleware import invalidate_user_cache, revoke_tokens_issued_before
 from core.auth.models import (
     APIKeyCreate,
     APIKeyDeleteResponse,
@@ -35,9 +36,26 @@ from core.auth.models import (
     UserRoleUpdate,
 )
 from core.auth.passwords import hash_password, verify_password
+from core.concurrency.executors import run_in_service_executor
+from core.db.logger import get_logger
 from core.observability.context import build_request_context
 
+logger = get_logger(__name__)
+
 auth_router = APIRouter(prefix="/api/auth", tags=["authentication"])
+
+# Fixed-salt hash of a value nobody will ever type as a real password.
+# `login_user()` verifies against this whenever the username lookup
+# misses, so the PBKDF2 cost is paid on every login attempt regardless
+# of whether the account exists -- otherwise "unknown username" returns
+# near-instantly while "known username, wrong password" pays the full
+# ~200k-iteration hash, and that latency gap is enough to enumerate
+# valid usernames from response timing alone.
+_DUMMY_PASSWORD_HASH = hash_password("no-such-account-rate-limiting-placeholder")
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 def _require_owner_or_admin(current_user: CurrentUser, owner_id: str) -> None:
@@ -126,10 +144,9 @@ async def create_api_key(
         return APIKeyResponse(**result)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to create API key: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to create API key for owner_id=%s", key_data.owner_id)
+        raise HTTPException(status_code=400, detail="Failed to create API key")
 
 
 @auth_router.get("/keys/{owner_id}", response_model=APIKeyListResponse)
@@ -160,10 +177,9 @@ async def list_api_keys(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to list API keys: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to list API keys for owner_id=%s", owner_id)
+        raise HTTPException(status_code=400, detail="Failed to list API keys")
 
 
 @auth_router.post("/keys/{key_id}/revoke", response_model=APIKeyRevokeResponse)
@@ -206,10 +222,9 @@ async def revoke_api_key(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to revoke API key: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to revoke API key key_id=%s", key_id)
+        raise HTTPException(status_code=400, detail="Failed to revoke API key")
 
 
 @auth_router.delete("/keys/{key_id}", response_model=APIKeyDeleteResponse)
@@ -252,10 +267,9 @@ async def delete_api_key(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to delete API key: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to delete API key key_id=%s", key_id)
+        raise HTTPException(status_code=400, detail="Failed to delete API key")
 
 
 # ============= USER MANAGEMENT ENDPOINTS =============
@@ -266,6 +280,7 @@ async def register_user(
     request: Request,
     user_data: UserCreate,
     service_manager=GetServiceManager,
+    settings: AppSettings = GetSettings,
 ) -> UserResponse:
     """Register a new user.
 
@@ -275,10 +290,22 @@ async def register_user(
     Returns:
         UserResponse with created user data
     """
+    if settings.auth_rate_limit_enabled and not rate_limiter.check_and_record(
+        f"register:{_client_ip(request)}",
+        max_attempts=settings.auth_rate_limit_max_attempts,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    ):
+        raise HTTPException(status_code=429, detail="Too many registration attempts")
+
     try:
         build_request_context(request)
 
-        password_hash = hash_password(user_data.password)
+        # PBKDF2 hashing is CPU-bound and takes real wall-clock time
+        # (~200k SHA-256 iterations) -- run it off the event loop so it
+        # doesn't stall every other in-flight request for its duration.
+        password_hash = await run_in_service_executor(
+            hash_password, user_data.password
+        )
         user_id = f"user_{int(time.time())}_{secrets.token_hex(4)}"
 
         # Self-service registration always creates a "user" account.
@@ -288,8 +315,11 @@ async def register_user(
         # Role elevation must go through a separate admin-only endpoint.
         fixed_role = "user"
 
-        # Create user
-        success = service_manager.users.create(
+        # Create user. This is a blocking SQLite call -- offload it the
+        # same way every other service_manager.users.* call in this
+        # file now is (see login_user/list_users/update_user_role).
+        success = await run_in_service_executor(
+            service_manager.users.create,
             user_id=user_id,
             username=user_data.username,
             email=user_data.email,
@@ -300,7 +330,6 @@ async def register_user(
         if not success:
             raise HTTPException(status_code=400, detail="Failed to create user")
 
-        # Log user registration
         service_manager.audit.log_audit_event(
             event_type="user.register",
             user_id=user_id,
@@ -321,10 +350,9 @@ async def register_user(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to register user: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to register user username=%s", user_data.username)
+        raise HTTPException(status_code=400, detail="Failed to register user")
 
 
 @auth_router.post("/users/login", response_model=AuthResponse)
@@ -342,15 +370,35 @@ async def login_user(
     Returns:
         AuthResponse with user data and token
     """
+    if settings.auth_rate_limit_enabled and not rate_limiter.check_and_record(
+        f"login:{_client_ip(request)}",
+        max_attempts=settings.auth_rate_limit_max_attempts,
+        window_seconds=settings.auth_rate_limit_window_seconds,
+    ):
+        raise HTTPException(status_code=429, detail="Too many login attempts")
+
     try:
         build_request_context(request)
 
-        # Get user by username
-        user = service_manager.users.get_by_username(login_data.username)
-        if not user or not verify_password(
-            login_data.password, user.get("password_hash", "")
-        ):
-            # Log failed login attempt
+        # Blocking SQLite read -- offload to the service executor
+        # instead of running it inline on the event loop.
+        user = await run_in_service_executor(
+            service_manager.users.get_by_username, login_data.username
+        )
+
+        # Always run the (CPU-bound, ~200k-iteration) password check,
+        # even when `user` is None -- against a fixed dummy hash in
+        # that case. Short-circuiting past verify_password() for an
+        # unknown username makes "no such user" measurably faster than
+        # "wrong password", which is enough of a timing side-channel to
+        # enumerate valid usernames. Also offloaded, for the same
+        # reason as hash_password() in register_user().
+        stored_hash = user.get("password_hash", "") if user else _DUMMY_PASSWORD_HASH
+        password_ok = await run_in_service_executor(
+            verify_password, login_data.password, stored_hash
+        )
+
+        if not user or not password_ok:
             service_manager.audit.log_audit_event(
                 event_type="user.login",
                 user_id=user.get("user_id") if user else "unknown",
@@ -359,7 +407,7 @@ async def login_user(
                 action="login",
                 success=False,
                 error_message="Invalid credentials",
-                ip_address=request.client.host if request.client else "unknown",
+                ip_address=_client_ip(request),
             )
             return AuthResponse(
                 success=False,
@@ -373,23 +421,27 @@ async def login_user(
                 success=False, user=None, token=None, message="Account is disabled"
             )
 
+        rate_limiter.reset(f"login:{_client_ip(request)}")
+
         # Normalize role(s) stored as `roles` in DB (comma-separated)
         primary_role = _primary_role(user)
 
+        issued_at = int(time.time())
         token_payload = {
             "user_id": user["user_id"],
             "username": user["username"],
             "role": primary_role,
-            "exp": int(time.time()) + settings.jwt_expiry_seconds,
+            "iat": issued_at,
+            "exp": issued_at + settings.jwt_expiry_seconds,
         }
         token = jwt.encode(
             token_payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm
         )
 
-        # Update last login
-        service_manager.users.update_last_login(user["user_id"])
+        await run_in_service_executor(
+            service_manager.users.update_last_login, user["user_id"]
+        )
 
-        # Log successful login
         service_manager.audit.log_audit_event(
             event_type="user.login",
             user_id=user["user_id"],
@@ -397,7 +449,7 @@ async def login_user(
             resource_id=user["user_id"],
             action="login",
             success=True,
-            ip_address=request.client.host if request.client else "unknown",
+            ip_address=_client_ip(request),
         )
 
         return AuthResponse(
@@ -413,10 +465,11 @@ async def login_user(
             token=token,
             message="Login successful",
         )
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to authenticate user: {str(e)}"
-        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to authenticate user username=%s", login_data.username)
+        raise HTTPException(status_code=400, detail="Failed to authenticate user")
 
 
 @auth_router.get("/users", response_model=UserListResponse)
@@ -434,7 +487,7 @@ async def list_users(
         build_request_context(request)
         _require_admin(current_user)
 
-        users_data = service_manager.users.list_all()
+        users_data = await run_in_service_executor(service_manager.users.list_all)
         users = []
         for user in users_data:
             users.append(
@@ -454,8 +507,9 @@ async def list_users(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to list users: {str(e)}")
+    except Exception:
+        logger.exception("Failed to list users")
+        raise HTTPException(status_code=400, detail="Failed to list users")
 
 
 @auth_router.patch("/users/{user_id}/role", response_model=UserResponse)
@@ -484,7 +538,9 @@ async def update_user_role(
         build_request_context(request)
         _require_admin(current_user)
 
-        target_user = service_manager.users.get_by_id(user_id)
+        target_user = await run_in_service_executor(
+            service_manager.users.get_by_id, user_id
+        )
         if not target_user:
             raise HTTPException(status_code=404, detail=f"User not found: {user_id}")
 
@@ -494,7 +550,7 @@ async def update_user_role(
         # demote the last remaining admin, refuse rather than silently
         # leaving the system with no one who can grant admin back.
         if previous_role == "admin" and role_update.role != "admin":
-            all_users = service_manager.users.list_all()
+            all_users = await run_in_service_executor(service_manager.users.list_all)
             remaining_admins = [
                 u
                 for u in all_users
@@ -506,7 +562,9 @@ async def update_user_role(
                     detail="Cannot demote the last remaining admin",
                 )
 
-        success = service_manager.users.update_role(user_id, role_update.role)
+        success = await run_in_service_executor(
+            service_manager.users.update_role, user_id, role_update.role
+        )
         if not success:
             raise HTTPException(status_code=400, detail="Failed to update user role")
 
@@ -514,6 +572,13 @@ async def update_user_role(
         # (or demoted) user's role stays as the middleware last cached it
         # for up to the cache's TTL.
         invalidate_user_cache(user_id)
+
+        # Any JWT already issued to this user was minted with the *old*
+        # role baked into its payload and, unlike the API-key path,
+        # would otherwise keep being honored with that stale role until
+        # it naturally expires. Force those tokens to be rejected so the
+        # role change takes effect immediately for JWT sessions too.
+        revoke_tokens_issued_before(user_id)
 
         service_manager.audit.log_audit_event(
             event_type="user.role_update",
@@ -525,7 +590,10 @@ async def update_user_role(
             metadata={"previous_role": previous_role, "new_role": role_update.role},
         )
 
-        updated_user = service_manager.users.get_by_id(user_id) or target_user
+        updated_user = (
+            await run_in_service_executor(service_manager.users.get_by_id, user_id)
+            or target_user
+        )
 
         return UserResponse(
             user_id=updated_user["user_id"],
@@ -537,7 +605,6 @@ async def update_user_role(
         )
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=400, detail=f"Failed to update user role: {str(e)}"
-        )
+    except Exception:
+        logger.exception("Failed to update role for user_id=%s", user_id)
+        raise HTTPException(status_code=400, detail="Failed to update user role")

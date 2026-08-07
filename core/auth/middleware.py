@@ -34,6 +34,26 @@ def invalidate_user_cache(user_id: str) -> None:
     _USER_CACHE.pop(user_id, None)
 
 
+# Per-process record of the most recent role change per user: user_id
+# -> epoch seconds. JWTs are self-contained (see the JWT branch below)
+# and normally trusted for their full lifetime once issued, so without
+# this a demoted admin would keep admin-level `scopes` in any token
+# minted before the demotion, for up to `jwt_expiry_seconds` after
+# being demoted -- unlike the API-key path, which re-checks the
+# caller's current role via `_get_cached_user`/`invalidate_user_cache`
+# on (near enough) every request. `routes/auth.py`'s `update_user_role`
+# calls `revoke_tokens_issued_before()` so any JWT already issued to
+# that user stops being honored immediately. Per-process, like
+# `_USER_CACHE` above -- not shared across multiple workers/instances.
+_REVOKED_BEFORE: dict = {}
+
+
+def revoke_tokens_issued_before(user_id: str, at: float | None = None) -> None:
+    """Invalidate any JWT for `user_id` issued before now (or `at`).
+    Call this whenever a user's role changes."""
+    _REVOKED_BEFORE[user_id] = at if at is not None else time.time()
+
+
 def _get_cached_user(user_id: str) -> dict | None:
     cached = _USER_CACHE.get(user_id)
     if cached is None:
@@ -169,6 +189,17 @@ def install_auth_middleware(app: FastAPI) -> None:
                         )
                     except jwt.PyJWTError:
                         payload = None
+
+                    if payload:
+                        user_id = payload.get("user_id", "")
+                        issued_at = payload.get("iat", 0)
+                        revoked_before = _REVOKED_BEFORE.get(user_id)
+                        if revoked_before is not None and issued_at < revoked_before:
+                            # This token predates a role change for its
+                            # holder; don't trust the (now stale) role
+                            # baked into its payload. Falls through to
+                            # the 401 below, forcing a fresh login.
+                            payload = None
 
                     if payload:
                         request.state.user_id = payload.get("user_id", "")

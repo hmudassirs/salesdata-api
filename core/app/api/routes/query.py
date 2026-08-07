@@ -16,13 +16,17 @@ from core.app.api.schemas import (
     TablesResponse,
 )
 from core.app.health import HealthCheck
+from core.app.settings import AppSettings
 from core.observability.context import build_request_context
 from core.concurrency.executors import all_executor_metrics
 from core.caching.persistence_queue import persistence_metrics
+from core.db.logger import get_logger
 from core.observability.alerts import get_alert_evaluator
 from core.db.session import DatabaseSession
 from core.services.query_limits import query_concurrency_metrics
 from core.services.query_service import QueryAuthorizationError, QueryService
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api", tags=["database"])
 
@@ -260,7 +264,13 @@ async def execute_query(
     build_request_context(request)
 
     params = tuple(query.params or [])
-    service = QueryService(db_session, service_manager.query_cache)
+    settings: AppSettings = request.app.state.settings
+    service = QueryService(
+        db_session,
+        service_manager.query_cache,
+        require_write_scope=settings.require_write_scope_for_mutations,
+        precise_cache_invalidation=settings.cache_invalidation_precise,
+    )
 
     try:
         outcome = await service.run(
@@ -299,14 +309,20 @@ async def list_tables(db_session: DatabaseSession = GetDB) -> TablesResponse:
         TablesResponse with table names and count
     """
     try:
-        tables = db_session._adapter.get_tables()
+        # `DatabaseSession.get_tables()` offloads the blocking adapter
+        # call to the service executor -- calling `db_session._adapter
+        # .get_tables()` directly here used to run it synchronously on
+        # the event loop, blocking every other in-flight request for
+        # the duration of the call.
+        tables = await db_session.get_tables()
 
         return TablesResponse(
             tables=tables,
             count=len(tables),
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list tables: {str(e)}")
+    except Exception:
+        logger.exception("Failed to list tables")
+        raise HTTPException(status_code=500, detail="Failed to list tables")
 
 
 @router.get("/tables/{table_name}/schema")
@@ -326,11 +342,11 @@ async def get_table_schema(
         GET /api/tables/users/schema
     """
     try:
-        known_tables = set(db_session._adapter.get_tables())
+        known_tables = set(await db_session.get_tables())
         if table_name not in known_tables:
             raise HTTPException(status_code=404, detail=f"Unknown table: {table_name}")
 
-        schema = db_session._adapter.get_schema(table_name)
+        schema = await db_session.get_schema(table_name)
 
         return {
             "table": table_name,
@@ -338,10 +354,11 @@ async def get_table_schema(
         }
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to fetch schema for table %s", table_name)
         raise HTTPException(
             status_code=404,
-            detail=f"Table or schema not found: {str(e)}",
+            detail=f"Table or schema not found: {table_name}",
         )
 
 
@@ -367,7 +384,7 @@ async def get_table_count(
         # against the real set of tables before being interpolated.
         # Previously this went straight into an f-string with no check
         # at all — a direct SQL-injection path via the URL path segment.
-        known_tables = set(db_session._adapter.get_tables())
+        known_tables = set(await db_session.get_tables())
         if table_name not in known_tables:
             raise HTTPException(status_code=404, detail=f"Unknown table: {table_name}")
 
@@ -384,10 +401,11 @@ async def get_table_count(
         }
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
+        logger.exception("Failed to count rows for table %s", table_name)
         raise HTTPException(
             status_code=404,
-            detail=f"Failed to count table: {str(e)}",
+            detail=f"Failed to count table: {table_name}",
         )
 
 
